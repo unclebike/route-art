@@ -1,0 +1,6 @@
+.DS_Store
+node_modules/
+dist/
+tests/_raw/
+tests/_mock/
+__pycache__/

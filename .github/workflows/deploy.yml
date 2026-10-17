@@ -17,10 +17,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Stage site
+        run: |
+          mkdir -p dist
+          cp index.html styles.css favicon.svg _headers dist/
+          cp -r js vendor dist/
+
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy . --project-name=route-art --branch=main
+          command: pages deploy dist --project-name=route-art --branch=main
           wranglerVersion: "4"
