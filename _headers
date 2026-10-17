@@ -1,0 +1,4 @@
+# Cloudflare Pages: make browsers check for a new build on every load,
+# so an update is picked up without a hard refresh.
+/*
+  Cache-Control: no-cache
