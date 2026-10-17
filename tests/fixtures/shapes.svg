@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300" viewBox="0 0 400 300">
+  <g fill="none" stroke="black">
+    <rect x="10" y="10" width="80" height="50"/>
+    <rect x="110" y="10" width="80" height="50" rx="10" ry="15"/>
+    <rect x="210" y="10" width="80" height="50" rx="12"/>
+    <circle cx="50" cy="150" r="30"/>
+    <ellipse cx="150" cy="150" rx="40" ry="20"/>
+    <line x1="210" y1="120" x2="290" y2="180"/>
+    <polyline points="10,220 40,260 70,220 100,260"/>
+    <polygon points="150,210 190,280 110,280"/>
+  </g>
+</svg>

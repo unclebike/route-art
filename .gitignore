@@ -4,3 +4,5 @@ dist/
 tests/_raw/
 tests/_mock/
 __pycache__/
+tests/fixtures/squiggle*
+tests/last_results.json

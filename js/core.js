@@ -188,6 +188,7 @@ export function exportRoutes(ordered, opts) {
   let prevEnd = null;
   for (const c of curves) {
     const m = c.map(([x, y]) => placer.toMerc(x, y));
+    for (const [X, Y] of m) { const [lon, lat] = unmerc(X, Y); if (lon < west) west = lon; if (lon > east) east = lon; if (lat < south) south = lat; if (lat > north) north = lat; }
     const midLat = unmerc(0, m[Math.floor(m.length / 2)][1])[1];
     const s = simplify(m, toleranceM / Math.cos(midLat * Math.PI / 180));
     const ll = s.map(([X, Y]) => unmerc(X, Y));
@@ -198,7 +199,6 @@ export function exportRoutes(ordered, opts) {
       const gap = prevEnd ? haversineKm(prevEnd[0], prevEnd[1], part[0][0], part[0][1]) : 0;
       pieces.push({ ll: part, km, gap });
       prevEnd = part[part.length - 1];
-      for (const [lon, lat] of part) { if (lon < west) west = lon; if (lon > east) east = lon; if (lat < south) south = lat; if (lat > north) north = lat; }
     }
   }
 
@@ -258,7 +258,8 @@ export function exportRoutes(ordered, opts) {
     const rname = nR > 1 ? `${name} ${String(k + 1).padStart(pad, '0')} of ${nR}` : name;
     routes.push({ name: rname, index: k + 1, points: coords.length, km, maxConnectorKm: maxGap, coords, kml: toKML(rname, coords), gpx: toGPX(rname, coords) });
   }
-  return { routes, totalKm, toleranceM, widthKm, bbox: { west, south, east, north } };
+  const routesKm = routes.reduce((a, r) => a + r.km, 0);
+  return { routes, totalKm: routesKm, toleranceM, widthKm, bbox: { west, south, east, north } };
 }
 
 const esc = (s) => String(s).replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]));
