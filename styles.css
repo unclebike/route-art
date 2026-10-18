@@ -112,6 +112,20 @@ input[type="range"] { padding: 0; border: 0; background: transparent; accent-col
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
 .dropveil { position: fixed; inset: 0; display: grid; place-items: center; font: 800 28px var(--font-ui); font-stretch: 78%; text-transform: uppercase; color: var(--on-accent); background: color-mix(in srgb, var(--accent) 70%, transparent); z-index: 50; pointer-events: none; }
 
+/* draw style */
+.style { border: 0; padding: 0; margin: 0; display: grid; gap: 10px; }
+.style legend { font-size: 12.5px; font-weight: 600; margin-bottom: 6px; padding: 0; }
+.seg { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; background: var(--raised); }
+.seg label { position: relative; display: block; }
+.seg input { position: absolute; opacity: 0; inset: 0; margin: 0; cursor: pointer; }
+.seg span { display: block; text-align: center; padding: 7px 4px; font-size: 12.5px; font-weight: 600; border-left: 1px solid var(--line); cursor: pointer; }
+.seg label:first-child span { border-left: 0; }
+.seg input:checked + span { background: var(--fg); color: var(--bg); }
+.seg input:focus-visible + span { outline: 2px solid var(--focus); outline-offset: -2px; }
+.seg input:disabled + span { opacity: .4; cursor: default; }
+.fillopts { display: grid; gap: 8px; }
+input[type="range"] { width: 100%; }
+
 /* map handles */
 .handle { width: 18px; height: 18px; border-radius: 50%; background: var(--accent); border: 3px solid #fff; box-shadow: 0 1px 4px rgb(0 0 0 / .45); cursor: grab; }
 .handle.move { width: 26px; height: 26px; border-radius: 6px; background: #fff; border: 2px solid var(--accent); display: grid; place-items: center; }

@@ -9,7 +9,10 @@ Options:
     --page PATH       page to open, relative to root (default: index.html;
                       tests/_mock/index.html runs the harness against the mock)
     --only a,b        only fixtures whose file name contains one of these substrings
-    --no-e2e          skip exportRoutes end-to-end checks
+    --no-e2e          skip exportRoutes / exportGroups end-to-end checks
+    --fill            only the squiggle-fill section (fill fixtures + buildShapes/squiggleFill/prepare/
+                      exportGroups checks + UI smoke). The default run includes it too.
+    --no-fill         skip the squiggle-fill section
     --port N          http port (default: random free port)
     --headed          show the browser
     --json FILE       also write all check results as JSON (default tests/last_results.json)
@@ -156,6 +159,47 @@ def hausdorff(ref_polys, ref_points, out_polys, tol):
     return d_ro, at_ro, d_or, at_or
 
 
+def split_spurs(curves, tol):
+    """order() may splice a closed loop into a neighbouring curve with an out-and-back spur
+    (segment A->B, later B->A, same vertices). Remove such retraced segment pairs (longer than tol)
+    and split the curves there. Returns (pieces, spur_len, n_spurs)."""
+    pieces, spur_len, n = [], 0.0, 0
+    split_spurs.max_len = 0.0
+    for c in curves:
+        c = as_np(c)
+        if len(c) < 3:
+            pieces.append(c)
+            continue
+        a, b = c[:-1], c[1:]
+        fwd = {}
+        for i, (p, q) in enumerate(zip(map(tuple, a), map(tuple, b))):
+            fwd.setdefault((p, q), []).append(i)
+        L = np.hypot(*(b - a).T)
+        spur = np.zeros(len(a), bool)
+        for (p, q), idx in fwd.items():
+            if p == q:
+                continue
+            tw = fwd.get((q, p))
+            if tw:
+                for i in idx:
+                    if L[i] > tol:
+                        spur[i] = True
+        if spur.any():
+            spur_len += float(L[spur].sum())
+            split_spurs.max_len = max(split_spurs.max_len, float(L[spur].max()))
+            n += int(spur.sum())
+            start = 0
+            for i in np.flatnonzero(spur):
+                if i + 1 - start >= 2:
+                    pieces.append(c[start:i + 1])
+                start = i + 1
+            if len(c) - start >= 2:
+                pieces.append(c[start:])
+        else:
+            pieces.append(c)
+    return pieces, spur_len, n // 2
+
+
 # ======================================================================= geo helpers
 def merc(lat, lon):
     lat = np.radians(np.clip(lat, -85.05112878, 85.05112878))
@@ -294,6 +338,77 @@ async (opts) => {
   return {ms, isPromise, totalKm: e.totalKm, bbox: e.bbox,
           routes: (e.routes || []).map(r => ({name: r.name, points: r.points, km: r.km,
                    maxConnectorKm: r.maxConnectorKm, kml: r.kml, gpx: r.gpx}))};
+}
+"""
+
+
+JS_EXPORT_GROUPS = """
+async (opts) => {
+  const C = window.RWGPSConv;
+  const t0 = performance.now();
+  let e = C.exportGroups(window.__prepared, opts);
+  const isPromise = !!(e && typeof e.then === 'function');
+  if (isPromise) e = await e;
+  const ms = performance.now() - t0;
+  return {ms, isPromise, totalKm: e.totalKm, bbox: e.bbox,
+          routes: (e.routes || []).map(r => ({name: r.name, points: r.points, km: r.km, group: r.group ?? null,
+                   index: r.index ?? null, maxConnectorKm: r.maxConnectorKm, kml: r.kml, gpx: r.gpx}))};
+}
+"""
+
+# ---- squiggle fill API
+JS_SHAPES = """
+async () => {
+  const C = window.RWGPSConv;
+  const t0 = performance.now();
+  let b = C.buildShapes(window.__parsed.paths);
+  const isPromise = !!(b && typeof b.then === 'function');
+  if (isPromise) b = await b;
+  const ms = performance.now() - t0;
+  window.__built = b;
+  return {ms, isPromise,
+          shapes: (b.shapes || []).map(s => ({rings: (s.rings || []).map(r => Array.from(r, q => [Number(q[0]), Number(q[1])]))})),
+          open: (b.open || []).map(p => ({layer: p.layer ?? null, n: (p.pts || []).length}))};
+}
+"""
+
+JS_FILL = """
+async ({i, spacing, seed, wobble, det}) => {
+  const C = window.RWGPSConv;
+  const rings = window.__built.shapes[i].rings;
+  const o = {spacing, seed};
+  if (wobble !== null && wobble !== undefined) o.wobble = wobble;
+  const run = async (opts) => { let r = C.squiggleFill(rings, opts); if (r && typeof r.then === 'function') r = await r; return r; };
+  const t0 = performance.now();
+  const loops = await run(o);
+  const ms = performance.now() - t0;
+  let same = null, diff = null, ms2 = null;
+  if (det) {
+    const key = JSON.stringify(loops);
+    const t1 = performance.now();
+    const b = await run({...o});
+    ms2 = performance.now() - t1;
+    same = JSON.stringify(b) === key;
+    const c = await run({...o, seed: seed + 1});
+    diff = JSON.stringify(c) !== key;
+  }
+  return {ms, ms2, same, diff, loops: (loops || []).map(l => Array.from(l, q => [Number(q[0]), Number(q[1])]))};
+}
+"""
+
+JS_PREPARE = """
+async (opts) => {
+  const C = window.RWGPSConv;
+  const t0 = performance.now();
+  let p = C.prepare(window.__parsed.paths, opts);
+  const isPromise = !!(p && typeof p.then === 'function');
+  if (isPromise) p = await p;
+  const ms = performance.now() - t0;
+  window.__prepared = p;
+  return {ms, isPromise, ncurves: (p.curves || []).length,
+          groups: (p.groups || []).map(g => ({name: g.name ?? null,
+              curves: (g.curves || []).map(c => Array.from(c, q => [Number(q[0]), Number(q[1])])),
+              jumps: Array.from(g.jumps || [], Number)}))};
 }
 """
 
@@ -442,17 +557,24 @@ def test_order(page, ref, parsed, res):
         return o
     tol = parsed["tol"]
     in_polys = [a for a in parsed["out_polys"] if len(a) >= 2]
-    curves_l = [c for c in curves if len(c) >= 2]
+    curves_l, spur_len, n_spurs = split_spurs([c for c in curves if len(c) >= 2], tol)
+    curves_l = [c for c in curves_l if len(c) >= 2]
+    max_spur = split_spurs.max_len
+    if n_spurs:
+        js_ = float(sum(o["jumps"]))
+        res.add(name, "order", "loop splice spurs (retraced connectors inside curves)", "INFO", n_spurs,
+                detail=f"max spur {max_spur:.3f}; 2 x sum(spur) = {spur_len:.3f}; 2 x spurs + sum(jumps) = "
+                       f"{spur_len + js_:.3f}; spurs excluded from the geometry comparisons below")
     d_io, at_io, d_oi, at_oi = hausdorff(in_polys, None, curves_l, tol)
     res.check(name, "order", "maxdist parsed->curves", d_io <= tol, d_io, tol,
               f"worst {np.round(at_io, 4).tolist() if at_io else None}" + ("" if d_io <= tol else " (geometry LOST by order())"))
     res.check(name, "order", "maxdist curves->parsed", d_oi <= tol, d_oi, tol,
-              f"worst {np.round(at_oi, 4).tolist() if at_oi else None}" + ("" if d_oi <= tol else " (order() INVENTED geometry - connectors inside curves?)"))
+              f"worst {np.round(at_oi, 4).tolist() if at_oi else None}" + ("" if d_oi <= tol else " (order() INVENTED geometry - a connector inside a curve that is not a retraced out-and-back spur?)"))
     Lin = sum(poly_length(a) for a in in_polys)
     Lout = sum(poly_length(a) for a in curves_l)
     rel = (Lout - Lin) / Lin if Lin else 0
     res.check(name, "order", "curve length vs parsed", abs(rel) <= 0.005, rel, 0.005,
-              "loops may be rotated; length must be preserved")
+              "loops may be rotated; length must be preserved (retraced spurs excluded)")
     # jumps vs actual gaps
     if len(o["jumps"]) == len(curves) - 1 and len(curves) > 1:
         gaps = np.array([np.hypot(*(curves[i + 1][0] - curves[i][-1])) for i in range(len(curves) - 1)])
@@ -469,11 +591,11 @@ def test_order(page, ref, parsed, res):
 
 
 def check_export(page, name, res, opts, *, parsed=None, expect_routes=None, expect_total_km=None,
-                 km_tol=0.02, routes_range=None, tag="e2e"):
+                 km_tol=0.02, routes_range=None, tag="e2e", js=JS_EXPORT, fn="exportRoutes"):
     try:
-        e = page.evaluate(JS_EXPORT, opts)
+        e = page.evaluate(js, opts)
     except Exception as ex:
-        res.add(name, tag, "exportRoutes() threw", "FAIL", detail=str(ex).splitlines()[0][:300])
+        res.add(name, tag, f"{fn}() threw", "FAIL", detail=str(ex).splitlines()[0][:300])
         return None
     res.add(name, tag, "time_ms", "INFO", round(e["ms"], 1),
             detail=f"opts tl={opts['tl']} br={opts['br']} rot={opts['rotationDeg']} tolM={opts['toleranceM']} "
@@ -591,6 +713,574 @@ def check_export(page, name, res, opts, *, parsed=None, expect_routes=None, expe
     return e
 
 
+# ======================================================================= squiggle fill
+FILL_SEED = 1
+FILL_WOBBLE = 0.22          # the UI default (prepare() also defaults to it)
+FILL_MS_BIKE_120 = 2000.0   # bike at spacing h/120 should fill in < 2 s
+FILL_SAMPLES = 2000
+FILL_COV_MAX = 2.5   # necks 2–2.5x spacing wide (e.g. where the bike i meets the k) can stay unfilled: no whole grid cell fits
+FILL_COV_P95 = 0.75
+
+
+def tool_polygon(rings):
+    from shapely.geometry import Polygon
+    rs = [as_np(r) for r in rings if len(r) >= 3]
+    if not rs:
+        return Polygon()
+    return Polygon(rs[0], rs[1:])
+
+
+def match_shapes(tool_polys, ref_polys):
+    """For each ref polygon, the index of the tool polygon with the largest overlap (or None)."""
+    out = []
+    for rp in ref_polys:
+        best, bi = 0.0, None
+        for i, tp in enumerate(tool_polys):
+            try:
+                a = tp.intersection(rp).area if tp.is_valid else shapely.make_valid(tp).intersection(rp).area
+            except Exception:
+                a = 0.0
+            if a > best:
+                best, bi = a, i
+        out.append(bi)
+    return out
+
+
+def boundary_tree(poly):
+    rings = [np.asarray(poly.exterior.coords)] + [np.asarray(r.coords) for r in poly.interiors]
+    t, _ = segments_tree(rings)
+    return t
+
+
+def dist_to(tree, pts):
+    if tree is None or len(pts) == 0:
+        return np.full(len(pts), np.inf)
+    _, d = tree.query_nearest(shapely.points(pts), return_distance=True, all_matches=False)
+    return d
+
+
+def check_loops(res, name, tag, sname, poly, loops, spacing, expect_loops, rng, stats):
+    """Geometry checks for squiggleFill output of ONE shape (poly = the rings the tool was given)."""
+    from shapely.geometry import LineString
+    lab = f"[{sname}]"
+    arrs = [as_np(l) for l in loops]
+    nv = sum(len(a) for a in arrs)
+    L = sum(poly_length(a) for a in arrs)
+    stats.update(loops=len(arrs), verts=nv, length=L)
+    # loop count
+    if expect_loops:
+        lo, hi = expect_loops
+        res.check(name, tag, f"{lab} loop count", lo <= len(arrs) <= hi, len(arrs), f"{lo}..{hi}" if lo != hi else lo)
+    else:
+        res.add(name, tag, f"{lab} loop count", "INFO", len(arrs), detail=f"{nv} vertices, length {L:.1f}")
+    if not arrs:
+        stats.update(min_clear=None, min_seg_clear=None, cov_max=None, cov_p95=None, cov_deep=None)
+        return
+    diag = math.hypot(*(np.ptp(np.vstack([np.asarray(poly.exterior.coords)]), axis=0)))
+    finite = all(np.isfinite(a).all() for a in arrs)
+    res.check(name, tag, f"{lab} all finite", finite)
+    if not finite:
+        return
+    # closed
+    gaps = [float(np.hypot(*(a[0] - a[-1]))) if len(a) else float("inf") for a in arrs]
+    short = sum(1 for a in arrs if len(a) < 4)
+    res.check(name, tag, f"{lab} loops closed (first == last)", max(gaps) <= 1e-9 * diag and not short,
+              max(gaps), 1e-9 * diag, f"{short} loops with < 4 points" if short else "")
+    # inside + clearance
+    P = np.vstack(arrs)
+    inside = shapely.contains_xy(poly, P[:, 0], P[:, 1])
+    n_out = int((~inside).sum())
+    res.check(name, tag, f"{lab} vertices inside shape", n_out == 0, n_out, 0,
+              f"e.g. {np.round(P[~inside][0], 3).tolist()}" if n_out else f"{len(P)} vertices")
+    d = dist_to(boundary_tree(poly), P)
+    i = int(np.argmin(d))
+    mc = float(d[i]) / spacing
+    stats["min_clear"] = mc
+    below05 = float(np.mean(d < 0.5 * spacing))
+    res.check(name, tag, f"{lab} min clearance / spacing", mc >= 0.3 and n_out == 0, mc, 0.3,
+              f"at {np.round(P[i], 3).tolist()}; {below05:.2%} of vertices < 0.5 x spacing")
+    # segments: must not cross the boundary; clearance of whole segments (a notch tip can poke
+    # between two clear vertices)
+    lines = [LineString(a) for a in arrs if len(a) >= 2]
+    bnd = poly.boundary
+    crossing = [k for k, ls in enumerate(lines) if not poly.contains(ls)]
+    res.check(name, tag, f"{lab} loop segments inside shape (no boundary crossing)", not crossing, len(crossing), 0,
+              f"loops {crossing[:5]}" if crossing else "")
+    segd = [bnd.distance(ls) for ls in lines]
+    ks = int(np.argmin(segd))
+    from shapely.ops import nearest_points
+    wp = nearest_points(lines[ks], bnd)
+    stats["min_seg_clear"] = segd[ks] / spacing
+    res.check(name, tag, f"{lab} min SEGMENT clearance / spacing", segd[ks] >= 0.3 * spacing, segd[ks] / spacing, 0.3,
+              f"loop {ks} passes {segd[ks]:.3f} from boundary point {np.round(wp[1].coords[0], 3).tolist()}", soft=True)
+    # simple + pairwise disjoint
+    bad = [k for k, ls in enumerate(lines) if not ls.is_simple]
+    det = ""
+    if bad:
+        ls = lines[bad[0]]
+        u = shapely.unary_union(ls)        # noded: extra nodes = self-intersections
+        segs = getattr(u, "geoms", [u])
+        ends = np.array([c for s in segs for c in (s.coords[0], s.coords[-1])])
+        uq, cnt = np.unique(np.round(ends, 9), axis=0, return_counts=True)
+        x = uq[cnt > 2][:3] if (cnt > 2).any() else uq[:0]
+        det = f"loop {bad[0]} ({len(arrs[bad[0]])} pts) self-intersects near {np.round(x, 3).tolist()}"
+    res.check(name, tag, f"{lab} loops simple (no self-intersections)", not bad, len(bad), 0, det)
+    tree = STRtree(lines)
+    pairs = tree.query(lines, predicate="intersects")
+    pairs = {(int(a), int(b)) for a, b in zip(*pairs) if a < b}
+    res.check(name, tag, f"{lab} loops pairwise disjoint", not pairs, len(pairs), 0,
+              f"e.g. loops {sorted(pairs)[:3]}" if pairs else "")
+    # coverage of the shape eroded by 1 x spacing
+    er = poly.buffer(-1.0 * spacing)
+    if er.is_empty:
+        res.add(name, tag, f"{lab} coverage", "INFO", detail="shape eroded by 1 x spacing is empty")
+        stats.update(cov_max=None, cov_p95=None, cov_deep=None)
+        return
+    x0, y0, x1, y1 = er.bounds
+    pts = np.zeros((0, 2))
+    tries = 0
+    while len(pts) < FILL_SAMPLES and tries < 200:
+        c = rng.uniform([x0, y0], [x1, y1], size=(FILL_SAMPLES * 4, 2))
+        c = c[shapely.contains_xy(er, c[:, 0], c[:, 1])]
+        pts = np.vstack([pts, c])[:FILL_SAMPLES]
+        tries += 1
+    lt, _ = segments_tree(arrs)
+    dd = dist_to(lt, pts) / spacing
+    j = int(np.argmax(dd))
+    p95 = float(np.percentile(dd, 95))
+    stats.update(cov_max=float(dd[j]), cov_p95=p95)
+    # The bike's letter strokes are only ~2 cells wide at h/40, so whole 2x-spacing cells
+    # can't cover them: that's a density limit, not a defect -> advisory there.
+    soft_cov = "bike" in name and "/40" in tag
+    res.check(name, tag, f"{lab} coverage p95 dist / spacing", p95 <= FILL_COV_P95, p95, FILL_COV_P95,
+              f"{float(np.mean(dd > 1.0)):.2%} of samples > 1 x spacing", soft=soft_cov)
+    res.check(name, tag, f"{lab} coverage max dist / spacing", dd[j] <= FILL_COV_MAX, float(dd[j]), FILL_COV_MAX, soft=soft_cov, detail=
+              f"p95 {p95:.3f}; worst sample at {np.round(pts[j], 3).tolist()}; {len(pts)} samples in shape eroded "
+              f"by 1 x spacing; {float(np.mean(dd > 1.0)):.2%} of samples > 1 x spacing")
+    # diagnostic: is the shortfall an edge band or a hole in the interior?
+    depth = dist_to(boundary_tree(poly), pts) / spacing
+    deep = depth >= 2.5
+    stats["cov_deep"] = float(dd[deep].max()) if deep.any() else None
+    fill_frac = L * spacing / poly.area if poly.area else 0.0
+    stats["len_ratio"] = fill_frac
+    res.add(name, tag, f"{lab} coverage diag", "INFO", stats["cov_deep"],
+            detail=f"max dist/spacing for samples >= 2.5 x spacing deep ({int(deep.sum())} samples); worst sample "
+                   f"depth {depth[j]:.2f} x spacing; fill length x spacing / area = {fill_frac:.2f} (1.0 = evenly filled)")
+
+
+def classify_curves(curves, polys, spacing, on_tol):
+    """Split prepared curves into ring geometry (all vertices on a shape boundary) and the rest.
+    Returns (ring_len, fill_len, n_between, n_outside, worst_between)."""
+    trees = [boundary_tree(p) for p in polys]
+    allp = np.vstack(curves) if curves else np.zeros((0, 2))
+    if not len(allp):
+        return 0.0, 0.0, 0, 0, None
+    db = np.min(np.stack([dist_to(t, allp) for t in trees]), axis=0) if trees else np.full(len(allp), np.inf)
+    ins = np.zeros(len(allp), bool)
+    for p in polys:
+        ins |= shapely.contains_xy(p, allp[:, 0], allp[:, 1])
+    ring_len = fill_len = 0.0
+    k = 0
+    for c in curves:
+        n = len(c)
+        on = db[k:k + n] <= on_tol
+        if on.all():
+            ring_len += poly_length(c)
+        else:
+            fill_len += poly_length(c)
+        k += n
+    between = (db > on_tol) & (db < 0.3 * spacing)
+    outside = (db > on_tol) & ~ins
+    wb = allp[np.argmax(between)].tolist() if between.any() else None
+    return ring_len, fill_len, int(between.sum()), int(outside.sum()), wb
+
+
+def group_shape_ids(curves, polys, on_tol):
+    """Which shapes the vertices of a group fall in (inside or on the boundary)."""
+    P = np.vstack(curves)
+    ids = set()
+    unassigned = 0
+    trees = [boundary_tree(p) for p in polys]
+    for i, p in enumerate(polys):
+        m = shapely.contains_xy(p, P[:, 0], P[:, 1]) | (dist_to(trees[i], P) <= on_tol)
+        if m.any():
+            ids.add(i)
+    return ids
+
+
+def map_with_box(polys_for_box, polys, tl, br):
+    """map_drawing() of `polys` using the bbox of `polys_for_box` (rotation 0)."""
+    allp = np.vstack(polys_for_box)
+    mn, mx = allp.min(0), allp.max(0)
+    TL = merc(np.array(tl[0]), np.array(tl[1]))
+    BR = merc(np.array(br[0]), np.array(br[1]))
+    out = []
+    for a in polys:
+        X = TL[0] + (a[:, 0] - mn[0]) / (mx[0] - mn[0]) * (BR[0] - TL[0])
+        Y = BR[1] + (a[:, 1] - mn[1]) / (mx[1] - mn[1]) * (TL[1] - BR[1])
+        out.append(np.stack([X, Y], -1))     # Mercator metres
+    return out
+
+
+def test_fill(page, ref, parsed, res, args):
+    from shapely.geometry import Polygon
+    name = ref["fixture"]
+    F = ref["fill"]
+    have = page.evaluate("['buildShapes','squiggleFill','prepare','exportGroups']"
+                         ".map(k => [k, typeof window.RWGPSConv[k] === 'function'])")
+    missing = [k for k, ok in have if not ok]
+    if missing:
+        res.add(name, "fill", "fill API missing", "FAIL", detail=", ".join(missing))
+        return None
+    # ------------------------------------------------ buildShapes
+    try:
+        b = page.evaluate(JS_SHAPES)
+    except Exception as e:
+        res.add(name, "shapes", "buildShapes() threw", "FAIL", detail=str(e).splitlines()[0][:300])
+        return None
+    shapes = b["shapes"]
+    polys = [tool_polygon(s["rings"]) for s in shapes]
+    ref_polys = [Polygon(s["rings"][0], s["rings"][1:]) for s in F["shapes"]]
+    soft_rec = F.get("record_only", False)
+    res.add(name, "shapes", "time_ms", "INFO", round(b["ms"], 1),
+            detail=f"{len(shapes)} shapes, holes {[len(s['rings']) - 1 for s in shapes]}, "
+                   f"areas {[round(p.area, 1) for p in polys]}, open {len(b['open'])}")
+    if b["isPromise"]:
+        res.add(name, "shapes", "returned a Promise (spec: sync)", "WARN")
+    if soft_rec:
+        def desc(ps):
+            return f"{len(ps)} shapes, holes {[len(p.interiors) for p in ps]}, areas {[round(p.area, 1) for p in ps]}"
+        alt = [Polygon(s["rings"][0], s["rings"][1:]) for s in F.get("alt", {}).get("shapes", [])]
+        def same(a, bb):
+            return len(a) == len(bb) and sorted(len(p.interiors) for p in a) == sorted(len(p.interiors) for p in bb) \
+                and all(abs(x - y) <= 0.01 * y for x, y in zip(sorted(p.area for p in a), sorted(p.area for p in bb)))
+        verdict = ("per-element fill then union (counters filled, no holes)" if same(polys, ref_polys) else
+                   "even-odd across elements (counters became holes)" if alt and same(polys, alt) else "neither")
+        res.add(name, "shapes", "RECORDED behaviour (nonzero, separate elements)", "INFO", len(shapes),
+                detail=f"tool: {desc(polys)}; union-ref: {desc(ref_polys)}; evenodd-ref: {desc(alt)} => matches {verdict}")
+    else:
+        res.check(name, "shapes", "shape count", len(shapes) == len(ref_polys), len(shapes), len(ref_polys))
+    res.check(name, "shapes", "open paths", len(b["open"]) == F.get("open_count", 0), len(b["open"]),
+              F.get("open_count", 0), soft=soft_rec)
+    valid = [p.is_valid for p in polys]
+    res.check(name, "shapes", "shape polygons valid (shapely)", all(valid), sum(not v for v in valid), 0,
+              "; ".join(shapely.is_valid_reason(p) for p, v in zip(polys, valid) if not v)[:200], soft=True)
+    m = match_shapes(polys, ref_polys)
+    names = {}
+    for rs, rp, ti in zip(F["shapes"], ref_polys, m):
+        if ti is None:
+            res.add(name, "shapes", f"[{rs['name']}] no matching tool shape", "WARN" if soft_rec else "FAIL")
+            continue
+        names[ti] = rs
+        tp = polys[ti]
+        rel = (tp.area - rp.area) / rp.area
+        res.check(name, "shapes", f"[{rs['name']}] area rel err", abs(rel) <= 0.01, rel, 0.01,
+                  f"tool {tp.area:.2f} vs shapely {rp.area:.2f} (tool shape #{ti})", soft=soft_rec)
+        res.check(name, "shapes", f"[{rs['name']}] holes", len(tp.interiors) == rs["holes"], len(tp.interiors),
+                  rs["holes"], soft=soft_rec)
+        sd = shapely.symmetric_difference(shapely.make_valid(tp), rp).area / rp.area
+        res.check(name, "shapes", f"[{rs['name']}] sym-diff area / area", sd <= 0.01, sd, 0.01, soft=soft_rec)
+    if len(set(i for i in m if i is not None)) != len([i for i in m if i is not None]):
+        res.add(name, "shapes", "two reference shapes matched the same tool shape", "WARN" if soft_rec else "FAIL")
+    if not shapes:
+        return None
+
+    H = F["height"]
+    rng = np.random.default_rng(12345)
+    summary = []
+    # ------------------------------------------------ squiggleFill per shape
+    runs = [(div, None, True, f"fill/{div}") for div in F["spacing_divs"]]
+    runs.append((F["spacing_divs"][0], FILL_WOBBLE, False, f"fillW/{F['spacing_divs'][0]}"))
+    for div, wob, det, tag in runs:
+        spacing = H / div
+        tot_ms = 0.0
+        agg = dict(loops=0, verts=0, min_clear=None, min_seg_clear=None, cov_max=None, cov_p95=None, cov_deep=None)
+        res.add(name, tag, "spacing", "INFO", spacing,
+                detail=f"height {H:.3f} / {div}; seed {FILL_SEED}" + (f"; wobble {wob}" if wob is not None else "; default opts"))
+        for i, poly in enumerate(polys):
+            rs = names.get(i)
+            sname = rs["name"] if rs else f"shape {i}"
+            exp = rs.get("loops") if (rs and div == F["spacing_divs"][0] and wob is None) else None
+            try:
+                o = page.evaluate(JS_FILL, dict(i=i, spacing=spacing, seed=FILL_SEED, wobble=wob, det=det))
+            except Exception as e:
+                res.add(name, tag, f"[{sname}] squiggleFill() threw", "FAIL", detail=str(e).splitlines()[0][:300])
+                continue
+            tot_ms += o["ms"]
+            st = {}
+            check_loops(res, name, tag, sname, poly if poly.is_valid else shapely.make_valid(poly), o["loops"],
+                        spacing, exp, rng, st)
+            res.add(name, tag, f"[{sname}] time_ms", "INFO", round(o["ms"], 1),
+                    detail=(f"repeat {o['ms2']:.1f} ms; " if o["ms2"] is not None else "") +
+                           f"{st.get('verts', 0)} vertices")
+            if det:
+                res.check(name, tag, f"[{sname}] same seed -> identical", bool(o["same"]), o["same"], True)
+                cells = poly.area / (2 * spacing) ** 2
+                if o["loops"]:
+                    res.check(name, tag, f"[{sname}] different seed -> different", bool(o["diff"]), o["diff"], True,
+                              f"~{cells:.0f} grid cells", soft=cells < 10)
+            agg["loops"] += st.get("loops", 0)
+            agg["verts"] += st.get("verts", 0)
+            for k, f in (("min_clear", min), ("min_seg_clear", min), ("cov_max", max), ("cov_p95", max),
+                         ("cov_deep", max)):
+                if st.get(k) is not None:
+                    agg[k] = st[k] if agg[k] is None else f(agg[k], st[k])
+        res.add(name, tag, "total fill time_ms", "INFO", round(tot_ms, 1), detail=f"{len(polys)} shapes")
+        if "bike" in name and div == 120 and wob is None:
+            res.check(name, tag, "bike fill time at h/120 (ms)", tot_ms < FILL_MS_BIKE_120, round(tot_ms, 1),
+                      FILL_MS_BIKE_120, soft=True)
+        elif tot_ms > SLOW_MS:
+            res.add(name, tag, "SLOW", "WARN", round(tot_ms), SLOW_MS)
+        summary.append(dict(fixture=name, run=tag, spacing=spacing, ms=tot_ms, **agg))
+
+    # ------------------------------------------------ prepare()
+    spacing = H / F["spacing_divs"][0]
+    n_open = len(b["open"])
+    on_tol = 1e-4 * parsed["diag"]
+    perim = sum(poly_length(np.asarray(r.coords)) for p in polys for r in [p.exterior, *p.interiors])
+    filled = set()
+    got = {}
+    fill_ref_len = 0.0          # squiggleFill with prepare()'s options (seed, default wobble)
+    for i in range(len(polys)):
+        try:
+            o = page.evaluate(JS_FILL, dict(i=i, spacing=spacing, seed=FILL_SEED, wobble=FILL_WOBBLE, det=False))
+            fill_ref_len += sum(poly_length(as_np(l)) for l in o["loops"])
+        except Exception:
+            pass
+    for mode in ("outline", "both", "fill"):
+        for grouping in ("shape", "join"):
+            tag = "prep"
+            lab = f"[{mode}/{grouping}]"
+            try:
+                p = page.evaluate(JS_PREPARE, dict(mode=mode, grouping=grouping, spacing=spacing, seed=FILL_SEED))
+            except Exception as e:
+                res.add(name, tag, f"{lab} prepare() threw", "FAIL", detail=str(e).splitlines()[0][:300])
+                continue
+            if p["isPromise"]:
+                res.add(name, tag, f"{lab} returned a Promise (spec: synchronous)", "WARN")
+            groups = p["groups"]
+            curves_raw = [as_np(c) for g in groups for c in g["curves"] if len(c)]
+            curves, spur_len, n_spurs = split_spurs(curves_raw, on_tol)
+            got[(mode, grouping)] = (p, curves)
+            total = sum(poly_length(c) for c in curves)
+            if n_spurs:
+                res.add(name, tag, f"{lab} loop splice spurs", "INFO", n_spurs,
+                        detail=f"spur length {spur_len:.2f} excluded from the length checks")
+            res.add(name, tag, f"{lab} groups", "INFO", len(groups),
+                    detail=f"{round(p['ms'], 1)} ms; names {[g['name'] for g in groups][:8]}; "
+                           f"curves/group {[len(g['curves']) for g in groups][:8]}; length {total:.1f}")
+            res.check(name, tag, f"{lab} top-level curves == concat(groups)", p["ncurves"] == len(curves_raw),
+                      p["ncurves"], len(curves_raw), soft=True)
+            if grouping == "join":
+                res.check(name, tag, f"{lab} group count", len(groups) == 1, len(groups), 1)
+            elif mode == "fill":
+                pass   # checked below once the fill loops are known
+            else:
+                want = len(polys) + (1 if n_open else 0)
+                res.check(name, tag, f"{lab} group count == shapes(+open)", len(groups) == want, len(groups), want)
+            # jumps
+            for gi, g in enumerate(groups):
+                cs = [as_np(c) for c in g["curves"]]
+                if len(g["jumps"]) != max(0, len(cs) - 1):
+                    res.add(name, tag, f"{lab} group {gi} jumps length != curves-1", "WARN", len(g["jumps"]),
+                            max(0, len(cs) - 1))
+                elif len(cs) > 1:
+                    gaps = np.array([np.hypot(*(cs[k + 1][0] - cs[k][-1])) for k in range(len(cs) - 1)])
+                    dev = float(np.max(np.abs(gaps - np.array(g["jumps"]))))
+                    if dev > 1e-6 * parsed["diag"] + 1e-9:
+                        res.add(name, tag, f"{lab} group {gi} jumps != gaps", "WARN", dev, 1e-6 * parsed["diag"])
+            if not curves:
+                res.add(name, tag, f"{lab} no geometry", "FAIL")
+                continue
+            if mode == "outline" and grouping == "join":
+                continue    # join+outline = the raw drawing (covered by the order checks)
+            rl, fl, nb, no, wb = classify_curves(curves, polys, spacing, on_tol)
+            if mode == "outline":
+                res.check(name, tag, f"{lab} only ring geometry (non-ring length)", fl == 0, fl, 0)
+                res.check(name, tag, f"{lab} ring length vs shape perimeters", abs(rl - perim) <= 0.005 * perim,
+                          (rl - perim) / perim, 0.005)
+            else:
+                if mode == "fill":
+                    res.check(name, tag, f"{lab} no ring geometry (ring length)", rl == 0, rl, 0)
+                else:
+                    res.add(name, tag, f"{lab} ring-only pieces length vs perimeters", "INFO", (rl - perim) / perim,
+                            detail="after removing spurs; informational")
+                    # every ring vertex lies on some output curve
+                    ct, _ = segments_tree(curves_raw)
+                    rv = np.vstack([np.asarray(r.coords) for pp in polys for r in [pp.exterior, *pp.interiors]])
+                    dv = dist_to(ct, rv)
+                    iw = int(np.argmax(dv))
+                    res.check(name, tag, f"{lab} every ring vertex on an output curve", dv[iw] <= on_tol, float(dv[iw]),
+                              on_tol, f"worst ring vertex {np.round(rv[iw], 3).tolist()}")
+                    tot_raw = sum(poly_length(c) for c in curves_raw)
+                    need = perim + fill_ref_len
+                    res.check(name, tag, f"{lab} total length >= perimeters + squiggleFill lengths",
+                              tot_raw >= need * (1 - 0.005), tot_raw / need, ">= 0.995",
+                              f"output {tot_raw:.1f} (incl. spurs) vs perimeters {perim:.1f} + fill {fill_ref_len:.1f}")
+                res.add(name, tag, f"{lab} fill length", "INFO", fl)
+                res.check(name, tag, f"{lab} vertices outside every shape", no == 0, no, 0)
+                res.check(name, tag, f"{lab} fill vertices with clearance < 0.3 x spacing", nb == 0, nb, 0,
+                          f"e.g. {np.round(wb, 3).tolist()} (prepare() default wobble applies)" if wb else "")
+            if grouping == "shape":
+                mixed = []
+                for gi, g in enumerate(groups):
+                    cs = [c for c in split_spurs([as_np(c) for c in g["curves"] if len(c)], on_tol)[0] if len(c)]
+                    if not cs or g["name"] == "lines":
+                        continue
+                    ids = group_shape_ids(cs, polys, on_tol)
+                    if len(ids) != 1:
+                        mixed.append(f"group {gi} '{g['name']}' -> shapes {sorted(ids)}")
+                    elif mode == "both" and classify_curves(cs, polys, spacing, on_tol)[1] > 0:
+                        filled |= ids
+                res.check(name, tag, f"{lab} each group within one shape", not mixed, len(mixed), 0,
+                          "; ".join(mixed[:3]))
+    if ("fill", "shape") in got and ("both", "shape") in got:
+        want = len(filled) + (1 if n_open else 0)
+        g = got[("fill", "shape")][0]["groups"]
+        res.check(name, "prep", "[fill/shape] group count == shapes with fill(+open)", len(g) == want, len(g), want,
+                  f"{len(polys)} shapes; shapes with no fill loops get no group")
+    if ("both", "shape") in got and ("both", "join") in got:
+        A = [c for c in got[("both", "shape")][1] if len(c) >= 2]
+        B = [c for c in got[("both", "join")][1] if len(c) >= 2]
+        a = sum(poly_length(c) for c in A)
+        bb = sum(poly_length(c) for c in B)
+        res.check(name, "prep", "[both] join vs shape-grouped length (spurs excluded)",
+                  abs(a - bb) <= 0.005 * max(a, 1e-9), (bb - a) / max(a, 1e-9), 0.005)
+        gt = 1e-3 * parsed["diag"]
+        d1, w1, d2, w2 = hausdorff(A, None, B, gt)
+        res.check(name, "prep", "[both] join vs shape-grouped geometry (max dist, spurs excluded)",
+                  max(d1, d2) <= gt, max(d1, d2), gt,
+                  f"worst {np.round(w1 if d1 >= d2 else w2, 3).tolist() if (w1 or w2) else None}")
+
+    # ------------------------------------------------ exportGroups end-to-end (bike only)
+    if "bike_outline" in name and not soft_rec and not args.no_e2e:
+        test_fill_e2e(page, name, res, polys, spacing)
+    return summary
+
+
+def test_fill_e2e(page, name, res, polys, spacing):
+    tag = "fill-e2e"
+    try:
+        p = page.evaluate(JS_PREPARE, dict(mode="both", grouping="shape", spacing=spacing, seed=FILL_SEED))
+    except Exception as e:
+        res.add(name, tag, "prepare() threw", "FAIL", detail=str(e).splitlines()[0][:300])
+        return
+    opts = dict(tl=SQ_TL, br=SQ_BR, rotationDeg=0, toleranceM=50, maxPoints=6000, maxKm=0, name="Bike")
+    e = check_export(page, name, res, opts, tag=tag, js=JS_EXPORT_GROUPS, fn="exportGroups")
+    if not e or not e["routes"]:
+        return
+    routes = e["routes"]
+    s = sum(r["km"] for r in routes)
+    res.check(name, tag, "sum(route.km) == totalKm (strict)", abs(s - e["totalKm"]) <= 1e-6 * max(s, 1e-9),
+              s, e["totalKm"])
+    nm = [r["name"] for r in routes]
+    res.check(name, tag, "route names unique", len(set(nm)) == len(nm), len(set(nm)), len(nm), "; ".join(nm[:6]))
+    idx = [r["index"] for r in routes]
+    res.check(name, tag, "route.index == 1..n", idx == list(range(1, len(routes) + 1)), idx[:8], "1..n", soft=True)
+    grp = [r["group"] for r in routes]
+    res.check(name, tag, "every route has a group", all(g is not None for g in grp), grp[:10], "int", soft=True)
+    ng = len(p["groups"])
+    res.check(name, tag, "routes >= groups and every group exported",
+              set(g for g in grp if g is not None) == set(range(ng)), sorted(set(grp)), f"0..{ng - 1}")
+    # placement: map the prepared geometry with the bbox of ALL groups, then compare
+    curves = [as_np(c) for g in p["groups"] for c in g["curves"] if len(c) >= 2]
+    lines_by_route = [parse_kml(r["kml"]) for r in routes]
+    all_lines = [l for ls in lines_by_route for l in ls]
+    exp = map_drawing(curves, opts["tl"], opts["br"], 0)
+    d_eg, d_ge, diag_m = geo_hausdorff(exp, all_lines)
+    thr = max(1.5 * opts["toleranceM"], 1e-3 * diag_m)
+    res.check(name, tag, "geo: prepared geometry(mapped) -> routes (m)", d_eg <= thr, d_eg, thr)
+    res.check(name, tag, "geo: route vertices -> prepared geometry (m)", d_ge <= thr, d_ge, thr)
+    # no route mixes shapes: every KML vertex must lie in ONE mapped shape (buffered by 2 x tolerance)
+    rings = [[np.asarray(p_.exterior.coords)] + [np.asarray(r.coords) for r in p_.interiors] for p_ in polys]
+    from shapely.geometry import Polygon
+    mapped = []
+    for rr in rings:
+        mr = map_with_box(curves, rr, opts["tl"], opts["br"])
+        mapped.append(Polygon(mr[0], mr[1:]))
+    k = 1.0 / math.cos(math.radians(max(opts["tl"][0], opts["br"][0])))
+    buf = [mp.buffer(2 * opts["toleranceM"] * k) for mp in mapped]
+    mixed, stray = [], []
+    for ri, ls in enumerate(lines_by_route):
+        P = merc(np.vstack(ls)[:, 0], np.vstack(ls)[:, 1])
+        hits = np.stack([shapely.contains_xy(bp, P[:, 0], P[:, 1]) for bp in buf])
+        best = int(np.argmax(hits.sum(1)))
+        nout = int((~hits[best]).sum())
+        if nout:
+            other = [j for j in range(len(buf)) if j != best and hits[j].any()]
+            (mixed if other else stray).append(f"route {ri} '{routes[ri]['name']}': {nout}/{len(P)} vertices outside "
+                                               f"shape {best}" + (f", in shapes {other}" if other else ""))
+    res.check(name, tag, "no route mixes shapes (KML vertices in one mapped shape)", not mixed, len(mixed), 0,
+              "; ".join(mixed[:3]))
+    res.check(name, tag, "route vertices inside a mapped shape", not stray, len(stray), 0, "; ".join(stray[:3]))
+
+
+def test_ui_fill(browser, url, res, ready_timeout):
+    """Smoke: load bike_outline.svg through #file, pick Squiggle fill + one route per shape."""
+    name = "(ui) bike_outline.svg"
+    errors = []
+    ctx = browser.new_context()
+    page = ctx.new_page()
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    cons = []
+    page.on("console", lambda m: cons.append(m.text) if m.type == "error" else None)
+    try:
+        page.goto(url)
+        page.wait_for_function("window.RWGPSConv && window.RWGPSConv.ready === true", timeout=ready_timeout * 1000)
+        t0 = time.time()
+        page.set_input_files("#file", os.path.join(FIX, "bike_outline.svg"))
+        page.wait_for_function("document.querySelectorAll('#routes li').length >= 1", timeout=60_000)
+        res.add(name, "ui", "outline routes after load", "INFO", page.locator("#routes li").count(),
+                detail=f"{time.time() - t0:.1f} s")
+        # mode control: radio group name=mode, or a <select id=mode>
+        if page.locator("#mode").count() and page.evaluate("document.getElementById('mode').tagName") == "SELECT":
+            page.select_option("#mode", "fill")
+        else:
+            page.check("input[name=mode][value=fill]")
+        page.wait_for_function("!document.getElementById('busy') || document.getElementById('busy').hidden",
+                               timeout=60_000)
+        page.select_option("#grouping", "shape")
+        t1 = time.time()
+        page.wait_for_function("""() => { const b = document.getElementById('busy');
+              return (!b || b.hidden) && document.querySelectorAll('#routes li').length >= 2; }""", timeout=60_000)
+        page.wait_for_timeout(800)
+        n = page.locator("#routes li").count()
+        names = page.eval_on_selector_all("#routes li .rn", "els => els.map(e => e.textContent)")
+        note = page.evaluate("(document.getElementById('fillNote') || {}).textContent || ''")
+        summ = page.evaluate("(document.getElementById('summary') || {}).textContent || ''")
+        res.check(name, "ui", "routes listed (fill, one route per shape)", n >= 2, n, ">= 2",
+                  f"{time.time() - t1:.1f} s; {names[:4]}; summary '{summ[:80]}'; note '{note[:120]}'")
+        page.click("#shuffle")
+        page.wait_for_timeout(300)
+        page.wait_for_function("""() => { const b = document.getElementById('busy');
+              return (!b || b.hidden) && document.querySelectorAll('#routes li').length >= 2; }""", timeout=60_000)
+        res.check(name, "ui", "routes still listed after Shuffle", page.locator("#routes li").count() >= 2,
+                  page.locator("#routes li").count(), ">= 2")
+    except Exception as e:
+        res.add(name, "ui", "UI flow failed", "FAIL", detail=str(e).splitlines()[0][:300])
+    res.check(name, "ui", "no uncaught page errors", not errors, len(errors), 0, "; ".join(errors[:3])[:300])
+    if cons:
+        res.add(name, "ui", "console errors", "WARN", len(cons), detail="; ".join(cons[:3])[:300])
+    ctx.close()
+
+
+def print_fill_summary(rows):
+    if not rows:
+        return
+    print("\n== Squiggle fill summary (per fixture / run; clearance and coverage in units of spacing)")
+    hdr = f"{'fixture':26s} {'run':10s} {'spacing':>9s} {'loops':>6s} {'verts':>7s} {'min clr':>8s} {'seg clr':>8s} " \
+          f"{'cov max':>8s} {'cov p95':>8s} {'cov dp':>8s} {'fill ms':>8s}"
+    print(hdr)
+    print("-" * len(hdr))
+    f = lambda v, s="{:.3f}": "-" if v is None else s.format(v)
+    for r in rows:
+        print(f"{r['fixture']:26s} {r['run']:10s} {r['spacing']:9.4f} {r['loops']:6d} {r['verts']:7d} "
+              f"{f(r['min_clear']):>8s} {f(r['min_seg_clear']):>8s} {f(r['cov_max']):>8s} {f(r['cov_p95']):>8s} "
+              f"{f(r['cov_deep']):>8s} {r['ms']:8.1f}")
+    print("  min clr/seg clr: min vertex / segment distance to the boundary; cov max/p95: distance from samples in the "
+          "shape eroded by 1 x spacing to the nearest loop; cov dp: same for samples >= 2.5 x spacing deep")
+
+
 # ======================================================================= main
 def main():
     ap = argparse.ArgumentParser()
@@ -598,6 +1288,8 @@ def main():
     ap.add_argument("--page", default="index.html")
     ap.add_argument("--only", default="")
     ap.add_argument("--no-e2e", action="store_true")
+    ap.add_argument("--fill", action="store_true", help="only the squiggle-fill section")
+    ap.add_argument("--no-fill", action="store_true", help="skip the squiggle-fill section")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--json", default=os.path.join(HERE, "last_results.json"))
@@ -638,6 +1330,9 @@ def main():
                           page.evaluate(f"typeof window.RWGPSConv.{fn} === 'function'"))
 
             refs = load_refs(only)
+            if args.fill:
+                refs = [r for r in refs if "fill" in r]
+            fill_rows = []
             parsed_by_name = {}
             for ref in refs:
                 name = ref["fixture"]
@@ -647,6 +1342,11 @@ def main():
                     continue
                 parsed_by_name[name] = parsed
                 o = test_order(page, ref, parsed, res)
+                if "fill" in ref and not args.no_fill:
+                    print(f"  -- squiggle fill ({ref['fill']['rule']}{', record only' if ref['fill'].get('record_only') else ''})")
+                    rows = test_fill(page, ref, parsed, res, args)
+                    fill_rows += rows or []
+                    page.evaluate("() => { window.__built = null; window.__prepared = null; }")
                 if o is None or args.no_e2e:
                     continue
                 base = dict(rotationDeg=0, toleranceM=50, maxPoints=6000, maxKm=0, name="Squiggle")
@@ -665,6 +1365,11 @@ def main():
                                      parsed=parsed, expect_routes=1, tag="rot90")
                 # free page memory between fixtures
                 page.evaluate("() => { window.__parsed = null; window.__ordered = null; }")
+            if not args.no_fill and (not only or any(o in "bike_outline.svg" for o in only)) \
+                    and os.path.exists(os.path.join(FIX, "bike_outline.svg")):
+                print("\n== UI smoke: squiggle fill")
+                test_ui_fill(browser, url, res, args.ready_timeout)
+            print_fill_summary(fill_rows)
             browser.close()
     finally:
         server.kill()
@@ -707,7 +1412,7 @@ def finish(res, console_errors, page_errors, console_warnings, args, t_start):
         except Exception:
             return str(r["value"])
 
-    hdr = f"{'fixture':20s} {'result':6s} {'ref->out':>9s} {'out->ref':>9s} {'tol':>8s} {'len err':>9s} " \
+    hdr = f"{'fixture':26s} {'result':6s} {'ref->out':>9s} {'out->ref':>9s} {'tol':>8s} {'len err':>9s} " \
           f"{'parse ms':>9s} {'order ms':>9s} {'sum jumps':>10s} {'e2e ms':>8s} {'totalKm':>9s} {'routes':>6s}"
     print(hdr)
     print("-" * len(hdr))
@@ -720,7 +1425,7 @@ def finish(res, console_errors, page_errors, console_warnings, args, t_start):
         nwarn += w
         status = "FAIL" if f else ("WARN" if w else "PASS")
         tolr = get(fx, "parse", "maxdist ref->out")
-        print(f"{fx:20s} {status:6s} {num(fx, 'parse', 'maxdist ref->out'):>9s} {num(fx, 'parse', 'maxdist out->ref'):>9s} "
+        print(f"{fx:26s} {status:6s} {num(fx, 'parse', 'maxdist ref->out'):>9s} {num(fx, 'parse', 'maxdist out->ref'):>9s} "
               f"{(fmt(tolr['threshold']) if tolr else '-'):>8s} {num(fx, 'parse', 'length rel err', '{:+.2e}'):>9s} "
               f"{num(fx, 'parse', 'time_ms', '{:.0f}'):>9s} {num(fx, 'order', 'time_ms', '{:.0f}'):>9s} "
               f"{num(fx, 'order', 'sum(jumps)', '{:.1f}'):>10s} "

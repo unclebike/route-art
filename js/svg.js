@@ -306,14 +306,21 @@ export function parseSVG(text) {
       return out;
     };
 
-    const emit = (lines, regions, layer) => {
-      let ls = lines.filter((l) => l.length >= 2);
+    let elemNo = 0;
+    const emit = (polys, regions, layer, rule) => {
+      const elem = elemNo++;
+      let ls = polys.filter((p) => p.pts.length >= 2);
       if (regions.length) {
-        let cl = ls.map(ck.toC);
+        // clipped pieces are open lines
+        let cl = ls.map((p) => ck.toC(p.pts));
         for (const r of regions) cl = ck.clipLines(cl, r);
-        ls = cl.map(ck.fromC);
+        ls = cl.map((c) => ({ pts: ck.fromC(c), closed: false }));
       }
-      for (const pts of ls) if (pts.length >= 2) { paths.push({ layer, pts: pts.map(([x, y]) => [x, -y]), closed: false }); layers.add(layer); }
+      for (const p of ls) {
+        if (p.pts.length < 2) continue;
+        paths.push({ layer, pts: p.pts.map(([x, y]) => [x, -y]), closed: !!p.closed, rule, elem });
+        layers.add(layer);
+      }
     };
 
     const visit = (el, layer, regions) => {
@@ -329,8 +336,8 @@ export function parseSVG(text) {
         const regs = regions.concat(regionsFor(ch));
         if (SHAPES.has(tag)) {
           const m = toRoot(ch);
-          const lines = shapeToPolys(ch, tolRoot / scaleOf(m)).map((p) => p.pts.map(([x, y]) => ap(m, x, y)));
-          emit(lines, regs, lay || 'Drawing');
+          const polys = shapeToPolys(ch, tolRoot / scaleOf(m)).map((p) => ({ pts: p.pts.map(([x, y]) => ap(m, x, y)), closed: p.closed }));
+          emit(polys, regs, lay || 'Drawing', st && st.fillRule === 'evenodd' ? 'evenodd' : 'nonzero');
         } else if (tag === 'svg' || tag === 'g' || tag === 'a') visit(ch, lay, regs);
       }
     };

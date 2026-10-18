@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="240" viewBox="0 0 1040 240">
+  <g transform="translate(20,20)" fill="black" stroke="none">
+    <rect id="square" x="0" y="0" width="200" height="200"/>
+    <path id="annulus" fill-rule="evenodd" d="M250,100 A100,100 0 1,0 450,100 A100,100 0 1,0 250,100 Z M300,100 A50,50 0 1,1 400,100 A50,50 0 1,1 300,100 Z"/>
+    <polygon id="dumbbell" points="500,50 600,50 600,96.25 660,96.25 660,50 760,50 760,150 660,150 660,103.75 600,103.75 600,150 500,150"/>
+    <rect id="bar" x="800" y="98" width="200" height="4"/>
+  </g>
+</svg>

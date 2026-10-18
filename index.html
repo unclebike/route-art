@@ -41,6 +41,28 @@
             <div id="layerlist"></div>
           </fieldset>
         </div>
+        <fieldset class="style" id="styleSet" hidden>
+          <legend>Draw</legend>
+          <div class="seg" role="radiogroup" aria-label="Draw">
+            <label><input type="radio" name="mode" id="mode-outline" value="outline" checked><span>Outline</span></label>
+            <label><input type="radio" name="mode" id="mode-fill" value="fill"><span>Squiggle fill</span></label>
+            <label><input type="radio" name="mode" id="mode-both" value="both"><span>Fill + outline</span></label>
+          </div>
+          <div class="fillopts" id="fillOpts" hidden>
+            <div class="field">
+              <label for="density">Density <span class="unit" id="densityOut"></span></label>
+              <input type="range" id="density" min="10" max="300" step="1" value="140">
+            </div>
+            <div class="field">
+              <label for="wobble">Wobble <span class="unit" id="wobbleOut"></span></label>
+              <input type="range" id="wobble" min="0" max="35" step="1" value="22">
+            </div>
+            <div class="btn-row">
+              <button type="button" class="btn" id="shuffle">Shuffle pattern</button>
+            </div>
+          </div>
+          <p class="hint" id="fillNote"></p>
+        </fieldset>
       </section>
 
       <section class="step" aria-labelledby="h-place">
@@ -75,6 +97,10 @@
           <div class="field span2">
             <label for="rname">Route name</label>
             <input id="rname" autocomplete="off">
+          </div>
+          <div class="field span2">
+            <label for="grouping">Shapes</label>
+            <select id="grouping"><option value="join">Join everything into one route</option><option value="shape">One route per shape</option></select>
           </div>
           <div class="field">
             <label for="tol">Smoothing <span class="unit">m</span></label>

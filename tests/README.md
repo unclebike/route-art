@@ -10,7 +10,9 @@ Python code (ezdxf for DXF, svgelements for SVG).
 cd /home/claude/route-art
 python3 -I tests/run_tests.py                         # everything (~2-3 min, mostly squiggle)
 python3 -I tests/run_tests.py --only arcs,paths.svg   # substring filter on fixture names
-python3 -I tests/run_tests.py --no-e2e                # skip exportRoutes checks
+python3 -I tests/run_tests.py --no-e2e                # skip exportRoutes / exportGroups checks
+python3 -I tests/run_tests.py --fill                  # only the squiggle-fill section (~40 s)
+python3 -I tests/run_tests.py --no-fill               # skip it
 python3 -I tests/run_tests.py --page tests/_mock/index.html   # self-test the harness against the mock
 ```
 
@@ -49,6 +51,15 @@ total length, bbox, the tolerance and any extra expectations.
 | paths_compact.svg | svgo-style compact numbers and packed arc flags |
 | ignored.svg | defs/clipPath/mask/symbol/marker/pattern ignored, `<text>` warning, exactly 1 path |
 | squiggle.svg | squiggle as straight-segment paths inside `translate(100,50) scale(0.5)` |
+| bike_outline.dxf | the 4 closed SPLINEs at the end of Block_0 of bike_squiggle_fill.dxf: "bike" word outline, i-dot, b and e counters. Even-odd: 2 shapes (word with 2 holes, i-dot) |
+| bike_outline.svg | same rings as ONE compound `<path fill-rule="evenodd">` in `translate(-470,-105) scale(1.2)` |
+| bike_outline_nonzero.svg | same rings as 4 separate `<path>`s (nonzero). Per-element fill then union, so the counters are filled in (2 shapes, 0 holes). Recorded only (INFO) |
+| fill_shapes.svg | square, annulus (evenodd), dumbbell with a 1.5 x spacing neck, bar narrower than spacing (no fill). Spacing h/40 = 5 |
+
+Fill fixtures carry a `fill` block in their ref (shapely reference: shapes with rings, areas, holes, expected
+loop counts, `height`, `spacing_divs`). `bike_outline.dxf` is committed. To re-extract it from the 22 MB original
+(not committed), run `BIKE_DXF=/path/to/bike_squiggle_fill.dxf python3 -I tests/make_fixtures.py --fill-only`.
+`--fill-only` regenerates only the fill fixtures.
 
 ## Checks
 
@@ -65,6 +76,22 @@ total length, bbox, the tolerance and any extra expectations.
   **geo** compares the routes in metres against the spec mapping (rotate about the bbox centre, then
   map linearly in Web Mercator) applied to the parsed drawing. This catches mirroring, lat/lon swaps
   and projection errors.
+- **order** accepts loop-splice spurs. A connector inside a curve is OK only if it is retraced (segment A->B and
+  later B->A in the same curve). Spurs are left out of the geometry and length comparisons and reported as INFO. Any
+  other connector inside a curve FAILs as invented geometry.
+- **shapes** (buildShapes): shape count, area (≤ 1%), holes and sym-diff vs shapely (polygonize + even-odd, or
+  union for the nonzero variant).
+- **fill/N, fillW/N** (squiggleFill per shape, spacing = height/N, seed 1; fillW = wobble 0.22): loops closed,
+  vertices inside, vertex clearance ≥ 0.3 x spacing, segments inside (no boundary crossing), segment clearance
+  (WARN), simple, pairwise disjoint, coverage of the shape eroded by 1 x spacing (p95 ≤ 0.75, max ≤ 2.0 x spacing),
+  loop counts, determinism and timing (bike h/120 < 2 s, WARN).
+- **prep** (prepare, h/40): group counts for outline/fill/both x shape/join, ring-only geometry for outline, every
+  ring vertex on an output curve, total length ≥ perimeters + squiggleFill lengths, fill clearance, each group
+  inside one shape, join vs per-shape geometry (spurs excluded, 0.5%).
+- **fill-e2e** (exportGroups on bike_outline.*): KML/GPX, totals, maxPoints, unique names, every group exported,
+  geo placement, and no route mixing shapes (KML vertices tested against the mapped shapes).
+- **ui**: loads bike_outline.svg via `#file`, picks Squiggle fill (`input[name=mode]`) and `#grouping` = shape,
+  expects ≥ 2 routes in `#routes` and no page errors, then clicks `#shuffle`.
 - A phase slower than 5 s gives a WARN. Uncaught page errors FAIL. Console errors are printed.
 
 The squiggle stress fixtures (a 4.6 MB real-world DXF) aren't committed. To include them, run `SQUIGGLE_DXF=/path/to/squiggle.dxf python3 -I tests/make_fixtures.py`.

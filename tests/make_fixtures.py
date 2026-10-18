@@ -35,6 +35,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, "fixtures")
 # Optional real-world stress file (not committed): SQUIGGLE_DXF=/path/to/squiggle.dxf
 SQUIGGLE_SRC = os.environ.get("SQUIGGLE_DXF", "")
+# Optional real-world source for the fill fixtures (22 MB, not committed): BIKE_DXF=/path/to/bike_squiggle_fill.dxf
+# Only needed to re-extract bike_outline.dxf; the committed bike_outline.dxf is the source otherwise.
+BIKE_SRC = os.environ.get("BIKE_DXF", "")
 
 os.makedirs(FIX, exist_ok=True)
 
@@ -520,8 +523,206 @@ def make_svg(squiggle_ref):
                     "numbers. Jump threshold halved (scale 0.5).")
 
 
+# --------------------------------------------------------------------------- fill fixtures
+# Each fill fixture's ref gets an extra "fill" block (independent shapely reference):
+# "fill": {
+#   "height": drawing height (y extent of the filled region), "spacing_divs": [40, ...] -> spacing = height/div,
+#   "rule": "evenodd" | "nonzero-union",   # semantics used to build the reference
+#   "record_only": bool,                   # true => buildShapes result is only recorded (INFO), never fails
+#   "open_count": number of open paths expected in buildShapes().open,
+#   "shapes": [{"name", "area", "holes", "bbox", "rings": [[[x,y]...]...] (rings[0] outer),
+#               "loops": [min,max] | null (expected squiggleFill loop count at spacing height/40)}],
+#   "alt": {...same keys for the other semantics, recorded for comparison...}
+# }
+def ring_area(r):
+    return 0.5 * sum(r[i][0] * r[i + 1][1] - r[i + 1][0] * r[i][1] for i in range(len(r) - 1))
+
+
+def shapes_evenodd(rings):
+    """Even-odd fill of closed rings via polygonize: keep faces covered by an odd number of rings."""
+    import shapely
+    from shapely.geometry import LineString, Polygon
+    from shapely.ops import polygonize, unary_union
+    lines = unary_union([LineString(r) for r in rings])
+    polys = [Polygon(r) for r in rings]
+    keep = []
+    for face in polygonize(lines):
+        p = face.representative_point()
+        if sum(1 for q in polys if q.contains(p)) % 2 == 1:
+            keep.append(face)
+    g = unary_union(keep)
+    # cross-check with the symmetric-difference fold
+    sd = polys[0]
+    for q in polys[1:]:
+        sd = sd.symmetric_difference(q)
+    assert abs(sd.area - g.area) <= 1e-6 * g.area, (sd.area, g.area)
+    return list(getattr(g, "geoms", [g]))
+
+
+def shapes_union(polys):
+    from shapely.ops import unary_union
+    g = unary_union(polys)
+    return list(getattr(g, "geoms", [g]))
+
+
+def shape_json(name, poly, loops=None, nd=4):
+    poly = poly.simplify(0)   # drop collinear duplicates only
+    rings = [list(poly.exterior.coords)] + [list(i.coords) for i in poly.interiors]
+    return {"name": name, "area": poly.area, "holes": len(poly.interiors),
+            "bbox": [round(v, 6) for v in poly.bounds],
+            "rings": [rnd(r, nd) for r in rings], "loops": loops}
+
+
+def fill_block(shapes, divs=(40,), rule="evenodd", record_only=False, open_count=0, alt=None):
+    ys = [v for s in shapes for v in (s["bbox"][1], s["bbox"][3])]
+    out = {"height": max(ys) - min(ys), "spacing_divs": list(divs), "rule": rule, "record_only": record_only,
+           "open_count": open_count, "shapes": shapes}
+    if alt:
+        out["alt"] = alt
+    for s in shapes:
+        print(f"    shape {s['name']:12s} area={s['area']:.2f} holes={s['holes']} loops={s['loops']}")
+    return out
+
+
+def write_fill_ref(name, kind, polys, fill, **kw):
+    ref = write_ref(name, kind, polys, **kw)
+    ref["fill"] = fill
+    with open(os.path.join(FIX, name + ".ref.json"), "w") as f:
+        json.dump(ref, f, separators=(",", ":"))
+    return ref
+
+
+def extract_bike(src, dst):
+    """Copy the last 4 SPLINEs of Block_0 (the 'bike' outline, i-dot, b and e counters) to a new DXF."""
+    sdoc = ezdxf.readfile(src)
+    blk = sdoc.blocks.get("Block_0")
+    spl = [e for e in blk if e.dxftype() == "SPLINE"][-4:]
+    doc = ezdxf.new("R2018")
+    doc.header["$INSUNITS"] = 0
+    doc.layers.add("Layer 1")
+    msp = doc.modelspace()
+    for e in spl:
+        s = msp.add_spline(dxfattribs={"degree": e.dxf.degree, "flags": e.dxf.flags, "layer": e.dxf.layer})
+        s.control_points = [tuple(p) for p in e.control_points]
+        s.knots = list(e.knots)
+        if len(e.weights):
+            s.weights = list(e.weights)
+        assert e.closed
+    doc.saveas(dst)
+    print(f"  extracted {len(spl)} closed SPLINEs ({[e.dxf.handle for e in spl]}) from {src}")
+
+
+def bike_rings(doc, dist):
+    rings = []
+    for e in doc.modelspace().query("SPLINE"):
+        pts = dedupe([(p.x, p.y) for p in e.flattening(dist, segments=16)])
+        if math.dist(pts[0], pts[-1]) > 1e-9:
+            pts.append(pts[0])
+        else:
+            pts[-1] = pts[0]
+        rings.append(pts)
+    return rings
+
+
+def make_fill():
+    print("Fill fixtures")
+    from shapely.geometry import Polygon, box, Point
+    from shapely import affinity
+    dst = os.path.join(FIX, "bike_outline.dxf")
+    if BIKE_SRC and os.path.exists(BIKE_SRC):
+        extract_bike(BIKE_SRC, dst)
+    if not os.path.exists(dst):
+        print("  skipping bike_outline (set BIKE_DXF once to extract it)")
+    else:
+        doc = ezdxf.readfile(dst)
+        rings = bike_rings(doc, 0.002)                      # reference rings, ~3e-6 x diag
+        lens = sorted(poly_len(r) for r in rings)
+        assert len(rings) == 4 and abs(lens[-1] - 2982) < 5, lens
+        eo = sorted(shapes_evenodd(rings), key=lambda p: -p.area)
+        assert len(eo) == 2 and len(eo[0].interiors) == 2 and len(eo[1].interiors) == 0
+        un = sorted(shapes_union([Polygon(r) for r in rings]), key=lambda p: -p.area)
+        eo_j = [shape_json("bike word", eo[0]), shape_json("i dot", eo[1])]
+        un_j = [shape_json("bike word", un[0]), shape_json("i dot", un[1])] if len(un) == 2 else \
+            [shape_json(f"union {i}", p) for i, p in enumerate(un)]
+        write_fill_ref("bike_outline.dxf", "dxf", rings, fill_block(eo_j, divs=(40, 120)), expect={"units": None},
+                       notes="4 closed SPLINEs from bike_squiggle_fill.dxf Block_0 (word outline ~2982 long, i-dot, "
+                             "b and e counters). Even-odd -> 2 shapes: word with 2 holes + i-dot")
+
+        # SVG variants: same rings flattened coarser (still fine), y flipped, inside a transformed group
+        srings = bike_rings(doc, 0.01)
+        T = (-470.0, -105.0, 1.2)        # transform="translate(-470,-105) scale(1.2)"
+        written = [dedupe([(round(x, 3), round(-y, 3)) for x, y in r]) for r in srings]
+        def ring_d(r):
+            r = r[:-1] if r[0] == r[-1] else r
+            return "M" + " L".join(f"{x:g},{y:g}" for x, y in r) + " Z"
+        def to_ref(r):
+            r = r[:-1] if r[0] == r[-1] else r
+            r = [(T[0] + T[2] * x, -(T[1] + T[2] * y)) for x, y in r]
+            return r + r[:1]
+        refr = [to_ref(r) for r in written]
+        head = (f'<?xml version="1.0" encoding="UTF-8"?>\n<svg {SVG_NS} width="620" height="700" '
+                f'viewBox="0 0 620 700">\n  <g transform="translate({T[0]:g},{T[1]:g}) scale({T[2]:g})" '
+                f'fill="#111" stroke="none">\n')
+        text = head + f'    <path fill-rule="evenodd" d="{" ".join(ring_d(r) for r in written)}"/>\n  </g>\n</svg>\n'
+        with open(os.path.join(FIX, "bike_outline.svg"), "w") as f:
+            f.write(text)
+        eo = sorted(shapes_evenodd(refr), key=lambda p: -p.area)
+        un = sorted(shapes_union([Polygon(r) for r in refr]), key=lambda p: -p.area)
+        eo_j = [shape_json("bike word", eo[0]), shape_json("i dot", eo[1])]
+        un_j = [shape_json("bike word", un[0]), shape_json("i dot", un[1])]
+        write_fill_ref("bike_outline.svg", "svg", refr, fill_block(eo_j, divs=(40, 120)), nd=4,
+                       expect={"path_count": 4},
+                       notes="bike_outline.dxf flattened, ONE compound <path fill-rule=evenodd> (4 subpaths) inside "
+                             "translate(-470,-105) scale(1.2); reference computed from the written numbers")
+        text = head + "".join(f'    <path d="{ring_d(r)}"/>\n' for r in written) + "  </g>\n</svg>\n"
+        with open(os.path.join(FIX, "bike_outline_nonzero.svg"), "w") as f:
+            f.write(text)
+        write_fill_ref("bike_outline_nonzero.svg", "svg", refr,
+                       fill_block(un_j, rule="nonzero-union", record_only=True,
+                                  alt={"rule": "evenodd", "shapes": eo_j}),
+                       nd=4, expect={"path_count": 4},
+                       notes="same 4 rings as SEPARATE <path> elements, default fill-rule nonzero. Per-element fill "
+                             "then union => counters are NOT holes (2 shapes, 0 holes). Behaviour is recorded only")
+
+    # synthetic shapes; svg coords (y-down) inside translate(20,20); height 200 -> spacing(h/40) = 5
+    sp = 5.0
+    neck = 1.5 * sp
+    n0, n1 = 100 - neck / 2, 100 + neck / 2
+    dumb = [(500, 50), (600, 50), (600, n0), (660, n0), (660, 50), (760, 50), (760, 150), (660, 150), (660, n1),
+            (600, n1), (600, 150), (500, 150)]
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg {SVG_NS} width="1040" height="240" viewBox="0 0 1040 240">
+  <g transform="translate(20,20)" fill="black" stroke="none">
+    <rect id="square" x="0" y="0" width="200" height="200"/>
+    <path id="annulus" fill-rule="evenodd" d="M250,100 A100,100 0 1,0 450,100 A100,100 0 1,0 250,100 Z M300,100 A50,50 0 1,1 400,100 A50,50 0 1,1 300,100 Z"/>
+    <polygon id="dumbbell" points="{' '.join(f'{x:g},{y:g}' for x, y in dumb)}"/>
+    <rect id="bar" x="800" y="98" width="200" height="{0.8 * sp:g}"/>
+  </g>
+</svg>
+"""
+    def tr(g):   # svg group coords -> tool coords (root user units, y up)
+        g = affinity.translate(g, 20, 20)
+        return affinity.scale(g, 1, -1, origin=(0, 0))
+    circ = lambda r: Point(350, 100).buffer(r, quad_segs=2048)
+    shp = [("square", box(0, 0, 200, 200), [1, 1]),
+           ("annulus", circ(100).difference(circ(50)), [1, 1]),
+           ("dumbbell", Polygon(dumb), [1, 2]),
+           ("bar", box(800, 98, 1000, 98 + 0.8 * sp), [0, 0])]
+    fj = [shape_json(n, tr(g), loops) for n, g, loops in shp]
+    with open(os.path.join(FIX, "fill_shapes.svg"), "w") as f:
+        f.write(svg)
+    polys = svg_reference(svg)
+    write_fill_ref("fill_shapes.svg", "svg", polys, fill_block(fj, divs=(40,)), expect={"path_count": 5},
+                   notes=f"filled: square 200, annulus R100/r50 (evenodd, one path), dumbbell 2x100^2 joined by a "
+                         f"neck {neck:g} wide (1.5 x spacing {sp:g}), bar {0.8 * sp:g} wide (< spacing: no fill)")
+
+
 if __name__ == "__main__":
     print("ezdxf", ezdxf.__version__)
+    if "--fill-only" in sys.argv:
+        make_fill()
+        sys.exit(0)
     sq = make_dxf()
     make_svg(sq)
+    make_fill()
     print("done ->", FIX)

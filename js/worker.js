@@ -1,12 +1,12 @@
-import { order } from './core.js';
+import { planGroups } from './plan.js';
 
 self.onmessage = (e) => {
-  const { id, paths } = e.data;
+  const { id, built, rawPaths, opts } = e.data;
   try {
     const t0 = Date.now();
-    const res = order(paths);
-    self.postMessage({ id, ok: true, ordered: res, ms: Date.now() - t0 });
+    const res = planGroups(built, rawPaths, opts);
+    self.postMessage({ id, ok: true, prepared: res, ms: Date.now() - t0 });
   } catch (err) {
-    self.postMessage({ id, ok: false, error: String(err && err.message || err) });
+    self.postMessage({ id, ok: false, error: String((err && err.message) || err) });
   }
 };

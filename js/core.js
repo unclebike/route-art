@@ -109,6 +109,29 @@ export function order(paths, { timeBudgetMs = 4000 } = {}) {
     if (!improved || Date.now() - t0 > timeBudgetMs) break;
   }
 
+  // closed loops start and end at the same vertex: re-pick that vertex for
+  // the final neighbours (2-opt moved them), minimising both connectors
+  for (let sweep = 0; sweep < 2; sweep++) {
+    for (let i = 0; i < seq.length; i++) {
+      const c = seq[i];
+      if (d2(c[0], c[c.length - 1]) > eps * 10 || c.length < 4) continue;
+      const prev = i > 0 ? seq[i - 1][seq[i - 1].length - 1] : null;
+      const next = i + 1 < seq.length ? seq[i + 1][0] : null;
+      if (!prev && !next) continue;
+      let bj = 0, bd = Infinity;
+      for (let j = 0; j < c.length - 1; j++) {
+        const v = (prev ? d2(prev, c[j]) : 0) + (next ? d2(c[j], next) : 0);
+        if (v < bd) { bd = v; bj = j; }
+      }
+      if (bj) seq[i] = c.slice(bj, c.length - 1).concat(c.slice(0, bj + 1));
+    }
+  }
+
+  // Splice closed loops into a neighbouring line instead of chaining them:
+  // at the closest pair of points, step across, go round the loop, step
+  // back. A short out-and-back spur replaces two long connectors.
+  spliceLoops(seq, diag, eps);
+
   // merge pieces that touch end-to-start
   const out = [seq[0].slice()];
   const jumps = [];
@@ -277,4 +300,84 @@ export function toGPX(name, coords) {
 ${coords.map(([lon, lat]) => `<trkpt lat="${lat.toFixed(6)}" lon="${lon.toFixed(6)}"/>`).join('\n')}
 </trkseg></trk></gpx>
 `;
+}
+
+// ---------- grouped export ----------
+// Every group (a shape, or everything joined) becomes its own route(s); all
+// groups share one placement so they stay registered to each other.
+export function exportGroups(prepared, opts) {
+  const all = prepared.curves || prepared.groups.flatMap((g) => g.curves);
+  if (!all.length) return { routes: [], totalKm: 0, bbox: null };
+  const box = opts.box || rotatedBox(all, opts.rotationDeg || 0);
+  const name = opts.name || 'Route';
+  const parts = prepared.groups.map((g) => exportRoutes(g, { ...opts, box, name: 'tmp' }));
+  const multi = prepared.groups.length > 1;
+  const routes = [];
+  let west = Infinity, south = Infinity, east = -Infinity, north = -Infinity;
+  parts.forEach((res, gi) => {
+    if (res.bbox) { west = Math.min(west, res.bbox.west); east = Math.max(east, res.bbox.east); south = Math.min(south, res.bbox.south); north = Math.max(north, res.bbox.north); }
+    const label = multi ? `${name} ${prepared.groups[gi].name || gi + 1}` : name;
+    res.routes.forEach((rt, k) => {
+      const rname = res.routes.length > 1 ? `${label} (${k + 1} of ${res.routes.length})` : label;
+      routes.push({ ...rt, group: gi, name: rname, kml: toKML(rname, rt.coords), gpx: toGPX(rname, rt.coords) });
+    });
+  });
+  routes.forEach((r, i) => { r.index = i + 1; });
+  const first = parts.find((p) => p.routes.length) || parts[0];
+  return { routes, totalKm: routes.reduce((a, r) => a + r.km, 0), toleranceM: first.toleranceM, widthKm: first.widthKm, bbox: { west, south, east, north } };
+}
+
+function spliceLoops(seq, diag, eps) {
+  const isClosed = (c) => c.length >= 4 && d2(c[0], c[c.length - 1]) <= eps * 10;
+  if (seq.length < 2 || seq.filter(isClosed).length > 300) return;
+  const t0 = Date.now();
+  for (let guard = 0; guard < 400 && seq.length > 1 && Date.now() - t0 < 3000; guard++) {
+    // grid of every vertex: [x, y, curve, index]
+    const total = seq.reduce((a, c) => a + c.length, 0);
+    const cell = Math.max(diag / Math.sqrt(total) * 2, diag * 1e-6);
+    const grid = new Map();
+    const key = (x, y) => `${Math.floor(x / cell)},${Math.floor(y / cell)}`;
+    seq.forEach((c, ci) => c.forEach((p, vi) => { const k = key(p[0], p[1]); let b = grid.get(k); if (!b) grid.set(k, b = []); b.push(ci, vi); }));
+    const nearestOther = (p, self, limit) => {
+      const gx = Math.floor(p[0] / cell), gy = Math.floor(p[1] / cell);
+      let best = null, bd = limit;
+      for (let r = 0; r * cell <= bd + cell; r++) {
+        for (let i = gx - r; i <= gx + r; i++) for (let j = gy - r; j <= gy + r; j++) {
+          if (Math.max(Math.abs(i - gx), Math.abs(j - gy)) !== r) continue;
+          const b = grid.get(`${i},${j}`); if (!b) continue;
+          for (let t = 0; t < b.length; t += 2) {
+            if (b[t] === self) continue;
+            const q = seq[b[t]][b[t + 1]];
+            const d = Math.hypot(q[0] - p[0], q[1] - p[1]);
+            if (d < bd) { bd = d; best = [b[t], b[t + 1], d]; }
+          }
+        }
+        if (r > 64) break;
+      }
+      return best;
+    };
+    let bestMove = null;
+    for (let i = 0; i < seq.length; i++) {
+      const L = seq[i];
+      if (!isClosed(L)) continue;
+      const prev = i > 0 ? seq[i - 1][seq[i - 1].length - 1] : null;
+      const next = i + 1 < seq.length ? seq[i + 1][0] : null;
+      const gain = (prev ? d2(prev, L[0]) : 0) + (next ? d2(L[L.length - 1], next) : 0) - (prev && next ? d2(prev, next) : 0);
+      if (gain <= 1e-9 * diag) continue;
+      const stride = Math.max(1, Math.floor(L.length / 600));
+      let cand = null;
+      for (let w = 0; w < L.length - 1; w += stride) {
+        const hit = nearestOther(L[w], i, cand ? cand.d : gain / 2);
+        if (hit) cand = { w, ci: hit[0], vi: hit[1], d: hit[2] };
+      }
+      if (cand && 2 * cand.d < gain - 1e-9 * diag && (!bestMove || gain - 2 * cand.d > bestMove.save)) bestMove = { i, ...cand, save: gain - 2 * cand.d };
+    }
+    if (!bestMove) break;
+    const { i, w, ci, vi } = bestMove;
+    const L = seq[i];
+    const Lrot = L.slice(w, L.length - 1).concat(L.slice(0, w + 1));
+    const C = seq[ci];
+    seq[ci] = C.slice(0, vi + 1).concat(Lrot, C.slice(vi));
+    seq.splice(i, 1);
+  }
 }

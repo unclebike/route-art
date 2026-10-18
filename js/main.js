@@ -1,9 +1,18 @@
 import { parseDXF } from './dxf.js';
 import { parseSVG } from './svg.js';
-import { order, exportRoutes, makePlacer, rotatedBox, merc, unmerc, haversineKm, autoToleranceM } from './core.js';
+import { order, exportRoutes, exportGroups, makePlacer, rotatedBox, merc, unmerc, haversineKm, autoToleranceM } from './core.js';
+import { buildShapes } from './shapes.js';
+import { planGroups } from './plan.js';
+import { squiggleFill } from './fill.js';
 
 // Test/automation hook
-window.RWGPSConv = { parseDXF, parseSVG, order, exportRoutes, ready: true };
+const spacingFor = (paths, density) => {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of paths) for (const [x, y] of p.pts) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+  return Math.sqrt(Math.max(1e-12, (x1 - x0) * (y1 - y0))) / Math.max(1, density);
+};
+const prepare = (paths, o = {}) => planGroups(buildShapes(paths), paths, { mode: 'outline', grouping: 'join', seed: 1, wobble: 0.22, ...o, spacing: o.spacing || spacingFor(paths, o.density || 90) });
+window.RWGPSConv = { parseDXF, parseSVG, order, exportRoutes, exportGroups, buildShapes, squiggleFill, prepare, ready: true };
 
 const $ = (id) => document.getElementById(id);
 const ROUTE_COLORS = ['#e8742c', '#4f7a28', '#2a7f8f', '#8a4f9e', '#b8860b', '#3f63b5', '#b33a3a', '#6b8e23'];
@@ -24,6 +33,7 @@ const SAMPLE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 150
 </svg>`;
 
 const S = {
+  seed: 1, frame: null, built: null, planKey: '', spacing: 0,
   fileName: null, kind: null, parsed: null, layerOn: new Set(),
   ordered: null, box: null, boxRot: null, preview: null,
   place: null, // { tl:[lat,lon], br:[lat,lon], rot }
@@ -85,7 +95,7 @@ function parseLL(s) {
 function getBox() {
   if (!S.ordered) return null;
   const rot = S.place ? S.place.rot : 0;
-  if (!S.box || S.boxRot !== rot) { S.box = rotatedBox(S.ordered.curves, rot); S.boxRot = rot; }
+  if (!S.box || S.boxRot !== rot) { S.box = rotatedBox(S.frame || S.ordered.curves, rot); S.boxRot = rot; }
   return S.box;
 }
 const aspect = () => { const b = getBox(); return b ? b.w / (b.h || 1) : 1; };
@@ -138,6 +148,7 @@ function drawAll() {
   hMove.setLngLat(unmerc((X1 + X2) / 2, (Y1 + Y2) / 2));
   showHandles(true);
   updateSize();
+  if (S.parsed) updateDensityLabel();
 }
 function showHandles(on) {
   if (on === handlesOn) return;
@@ -232,7 +243,7 @@ if (saved.fmt) $('fmt').value = saved.fmt;
 if (saved.keep === false) $('keep').checked = false;
 
 // ---------- export ----------
-const exportKey = () => JSON.stringify([S.place, $('tol').value, $('maxPts').value, $('maxKm').value, $('rname').value, S.fileName, [...S.layerOn]]);
+const exportKey = () => JSON.stringify([S.place, $('tol').value, $('maxPts').value, $('maxKm').value, $('rname').value, S.fileName, [...S.layerOn], S.planKey]);
 let expTimer = 0;
 function scheduleExport(delay = 350) {
   clearTimeout(expTimer);
@@ -245,7 +256,7 @@ function runExport() {
   busy('Building routes…');
   setTimeout(() => {
     try {
-      const res = exportRoutes(S.ordered, {
+      const res = exportGroups(S.ordered, {
         tl: S.place.tl, br: S.place.br, rotationDeg: S.place.rot, box: getBox(),
         toleranceM: parseFloat($('tol').value) || 0,
         maxPoints: Math.max(200, parseInt($('maxPts').value, 10) || 6000),
@@ -332,19 +343,20 @@ $('fmt').addEventListener('change', () => { if (S.result) renderRoutes(); });
 function busy(msg) { $('busy').hidden = !msg; if (msg) $('busyText').textContent = msg; }
 
 let worker = null, reqId = 0;
-function orderAsync(paths) {
+function planAsync(built, rawPaths, opts) {
   try { worker = worker || new Worker(new URL('./worker.js', import.meta.url), { type: 'module' }); } catch { worker = null; }
-  if (!worker) return Promise.resolve(order(paths));
+  const local = () => planGroups(built, rawPaths, opts);
+  if (!worker) return Promise.resolve(local());
   const id = ++reqId;
   return new Promise((resolve, reject) => {
     const onMsg = (e) => {
       if (e.data.id !== id) return;
       worker.removeEventListener('message', onMsg);
-      e.data.ok ? resolve(e.data.ordered) : reject(new Error(e.data.error));
+      e.data.ok ? resolve(e.data.prepared) : reject(new Error(e.data.error));
     };
     worker.addEventListener('message', onMsg);
-    worker.addEventListener('error', () => { worker = null; resolve(order(paths)); }, { once: true });
-    worker.postMessage({ id, paths: paths.map((p) => p.pts) });
+    worker.addEventListener('error', () => { worker = null; resolve(local()); }, { once: true });
+    worker.postMessage({ id, built: { shapes: built.shapes, open: built.open.map((p) => ({ pts: p.pts })) }, rawPaths: rawPaths.map((p) => ({ pts: p.pts })), opts });
   });
 }
 
@@ -376,22 +388,83 @@ function fail(name, msg) {
   $('layers').hidden = true;
 }
 
+const styleOpts = () => ({
+  mode: document.querySelector('input[name="mode"]:checked')?.value || 'outline',
+  grouping: $('grouping').value,
+  density: +$('density').value,
+  wobble: +$('wobble').value / 100,
+  seed: S.seed,
+});
+let planToken = 0;
 async function reorder({ refit = false } = {}) {
   const paths = S.parsed.paths.filter((p) => S.layerOn.has(p.layer));
   if (!paths.length) { S.ordered = null; S.result = null; renderRoutes(); drawAll(); return; }
-  busy(`Joining ${paths.length.toLocaleString()} pieces…`);
-  try { S.ordered = await orderAsync(paths); }
+  const token = ++planToken;
+  S.frame = paths.map((p) => p.pts);
+  S.built = buildShapes(paths);
+  const o = styleOpts();
+  if (!S.built.shapes.length && o.mode !== 'outline') { document.getElementById('mode-outline').checked = true; o.mode = 'outline'; }
+  o.spacing = spacingFor(paths, o.density);
+  S.spacing = o.spacing;
+  busy(o.mode === 'outline' ? `Joining ${paths.length.toLocaleString()} pieces…` : 'Drawing the squiggle…');
+  let prepared;
+  try { prepared = await planAsync(S.built, paths, o); }
   catch (e) { busy(false); return fail(S.fileName, e.message); }
+  if (token !== planToken) return; // a newer request is on its way
+  S.ordered = prepared;
+  S.planKey = JSON.stringify(o);
   S.box = null; S.result = null;
   // decimated copy for live dragging
   const total = S.ordered.curves.reduce((a, c) => a + c.length, 0);
   const k = Math.max(1, Math.ceil(total / 30000));
   S.preview = S.ordered.curves.map((c) => c.filter((_, i) => i % k === 0 || i === c.length - 1));
   renderFile();
+  renderStyle();
   busy(false);
   if (refit || !S.place) fitToView(); else setPlace(S.place, { exportNow: true });
   if (refit) setTimeout(zoomToPlace, 50);
 }
+
+function renderStyle() {
+  const shapes = S.built ? S.built.shapes.length : 0;
+  $('styleSet').hidden = !S.parsed;
+  for (const id of ['mode-fill', 'mode-both']) $(id).disabled = !shapes;
+  const mode = styleOpts().mode;
+  $('fillOpts').hidden = mode === 'outline';
+  updateDensityLabel();
+  $('wobbleOut').textContent = `${$('wobble').value}%`;
+  const st = S.ordered && S.ordered.stats;
+  let note = '';
+  if (!shapes) note = 'No closed shapes found, so there’s nothing to fill. Fill needs closed outlines.';
+  else if (mode !== 'outline' && st) {
+    note = `${shapes} shape${shapes === 1 ? '' : 's'}, ${st.fillLoops} fill line${st.fillLoops === 1 ? '' : 's'}.`;
+    if (st.splitShapes) note += ` ${st.splitShapes} shape${st.splitShapes === 1 ? ' has' : 's have'} parts too narrow to join at this density, so ${st.splitShapes === 1 ? 'it gets' : 'they get'} more than one line. Raise the density to fix.`;
+  }
+  $('fillNote').textContent = note;
+  $('fillNote').hidden = !note;
+}
+function updateDensityLabel() {
+  let txt = `${$('density').value} lines`;
+  if (S.place && S.box && S.parsed) {
+    const [X1] = toM(S.place.tl), [X2] = toM(S.place.br);
+    const midLat = (S.place.tl[0] + S.place.br[0]) / 2;
+    const mPerUnit = ((X2 - X1) / S.box.w) * Math.cos(midLat * Math.PI / 180);
+    const sp = spacingFor(S.parsed.paths.filter((p) => S.layerOn.has(p.layer)), +$('density').value) * mPerUnit;
+    txt += ` · ${sp >= 1000 ? `${(sp / 1000).toFixed(sp >= 10000 ? 0 : 1)} km` : `${Math.round(sp)} m`} apart`;
+  }
+  $('densityOut').textContent = txt;
+}
+for (const r of document.querySelectorAll('input[name="mode"]')) r.addEventListener('change', () => { store.set({ mode: r.value }); renderStyle(); reorder(); });
+$('density').addEventListener('input', updateDensityLabel);
+$('density').addEventListener('change', () => { store.set({ density: $('density').value }); reorder(); });
+$('wobble').addEventListener('input', () => { $('wobbleOut').textContent = `${$('wobble').value}%`; });
+$('wobble').addEventListener('change', () => { store.set({ wobble: $('wobble').value }); reorder(); });
+$('shuffle').addEventListener('click', () => { S.seed = (Math.random() * 2 ** 31) >>> 0; reorder(); });
+$('grouping').addEventListener('change', () => { store.set({ grouping: $('grouping').value }); reorder(); });
+if (saved.density) $('density').value = saved.density;
+if (saved.wobble != null) $('wobble').value = saved.wobble;
+if (saved.grouping) $('grouping').value = saved.grouping;
+if (saved.mode && $(`mode-${saved.mode}`)) $(`mode-${saved.mode}`).checked = true;
 
 function renderFile() {
   const p = S.parsed;
@@ -403,6 +476,7 @@ function renderFile() {
   const on = p.paths.filter((x) => S.layerOn.has(x.layer));
   add('Pieces', on.length.toLocaleString());
   if (S.ordered) {
+    if (S.built && S.built.shapes.length) add('Closed shapes', S.built.shapes.length.toLocaleString());
     add('Joined into', `${S.ordered.curves.length.toLocaleString()} line${S.ordered.curves.length === 1 ? '' : 's'}`);
     const b = getBox() || { w: 0, h: 0 };
     const u = p.units ? ` ${p.units}` : ' units';
